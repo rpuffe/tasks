@@ -168,6 +168,8 @@ run: build-image
 	echo "==> running on port $$port (ctrl-c to stop)"; \
 	docker run --rm -p $$port:$$port $$envargs --name $(CONTAINER) $(IMAGE)
 
-# Apps override this target with their own test command; the template has none.
+# Smoke test (create -> list -> complete, plus the error-path quality bar):
+# runs on the host with plain Node, no container involved.
 test:
-	@echo "no test command defined for this app — override the 'test' target in this Makefile if your app has one → see docs/example.md"
+	@command -v node >/dev/null 2>&1 || { echo "node not found — install Node.js to run tests"; exit 1; }
+	@node --test test/smoke.test.js
