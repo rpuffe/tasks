@@ -10,8 +10,9 @@ MANIFEST := app-manifest.yaml
 SCHEMA   := app-manifest.schema.json
 IMAGE    := flightdeck-preflight:latest
 CONTAINER := flightdeck-preflight-run
+REPO_URL := https://github.com/rpuffe/flightdeck
 
-.PHONY: preflight run test check-tools validate-manifest build-image health-check scan
+.PHONY: preflight run test check-tools validate-manifest build-image health-check scan upgrade
 
 preflight: check-tools validate-manifest build-image health-check scan
 	@echo "preflight clean — push to main to deploy"
@@ -23,6 +24,15 @@ preflight: check-tools validate-manifest build-image health-check scan
 check-tools:
 	@command -v docker >/dev/null 2>&1 || { echo "docker not found — install Docker Desktop → see docs/contract.md"; exit 1; }
 	@command -v yq >/dev/null 2>&1 || { echo "yq not found — install: brew install yq → see docs/contract.md"; exit 1; }
+	@pinned=$$(grep -o 'ref=v[0-9.]*' main.tf | sed 's/^ref=//'); \
+	if [ -f .flightdeck-version ]; then \
+	  contract=$$(cat .flightdeck-version); \
+	  if [ -n "$$pinned" ] && [ "$$contract" != "$$pinned" ]; then \
+	    echo "WARNING: contract files are $$contract but main.tf pins $$pinned — run make upgrade"; \
+	  fi; \
+	else \
+	  echo "note: no .flightdeck-version (pre-v0.5.0 contract) — run make upgrade to refresh"; \
+	fi
 
 # ---------------------------------------------------------------------------
 # 2. Manifest validation (mirrors app-manifest.schema.json)
@@ -31,12 +41,12 @@ check-tools:
 validate-manifest:
 	@test -f $(MANIFEST) || { echo "$(MANIFEST) not found at repo root → see docs/contract.md"; exit 1; }
 	@for k in $$(yq 'keys | .[]' $(MANIFEST)); do \
-	  case " name port healthcheck cpu memory env " in \
+	  case " name port healthcheck cpu memory env secrets storage auth alerts email " in \
 	    *" $$k "*) : ;; \
 	    *) if [ "$$k" = "image" ]; then \
 	         echo "app-manifest.yaml has an 'image' field — CI supplies the image, never add one → see docs/contract.md"; \
 	       else \
-	         echo "app-manifest.yaml has unknown field '$$k' — only name, port, healthcheck, cpu, memory, env are allowed → see docs/contract.md"; \
+	         echo "app-manifest.yaml has unknown field '$$k' — only name, port, healthcheck, cpu, memory, env, secrets, storage, auth, alerts, email are allowed → see docs/contract.md"; \
 	       fi; \
 	       exit 1 ;; \
 	  esac; \
@@ -49,10 +59,14 @@ validate-manifest:
 	  fi; \
 	done
 	@name=$$(yq '.name' $(MANIFEST)); \
-	echo "$$name" | grep -Eq '^[a-z][a-z0-9-]{0,19}$$' || { \
-	  echo "name '$$name' is invalid — must match ^[a-z][a-z0-9-]{0,19}$$ (lowercase, starts with a letter, max 20 chars) → see docs/contract.md"; \
+	echo "$$name" | grep -Eq '^[a-z][a-z0-9-]{0,15}$$' || { \
+	  echo "name '$$name' is invalid — must match ^[a-z][a-z0-9-]{0,15}$$ (lowercase, starts with a letter, max 16 chars — dev stacks append \"-dev\", so this leaves room under the 32-char target-group name limit) → see docs/contract.md"; \
 	  exit 1; \
-	}
+	}; \
+	if [ "$$name" = "wake" ]; then \
+	  echo "name 'wake' is reserved for the platform scaler endpoint — choose a different name → see docs/contract.md"; \
+	  exit 1; \
+	fi
 	@port=$$(yq '.port' $(MANIFEST)); \
 	case "$$port" in \
 	  ''|*[!0-9]*) echo "port '$$port' is invalid — must be an integer → see docs/contract.md"; exit 1 ;; \
@@ -80,12 +94,124 @@ validate-manifest:
 	fi
 	@if [ "$$(yq '.env' $(MANIFEST))" != "null" ]; then \
 	  for k in $$(yq '.env | keys | .[]' $(MANIFEST)); do \
+	    case "$$k" in \
+	      STORAGE_BUCKET) \
+	        echo "env.STORAGE_BUCKET is reserved — the platform injects it when storage: s3 is set, don't define it yourself → see docs/contract.md"; \
+	        exit 1 ;; \
+	      COGNITO_USER_POOL_ID|COGNITO_CLIENT_ID|COGNITO_DOMAIN|COGNITO_ISSUER) \
+	        echo "env.$$k is reserved — the platform injects it when auth: cognito is set, don't define it yourself → see docs/contract.md"; \
+	        exit 1 ;; \
+	      MAIL_FROM|MAIL_REGION) \
+	        echo "env.$$k is reserved — the platform injects it when email.from is set, don't define it yourself → see docs/contract.md"; \
+	        exit 1 ;; \
+	    esac; \
 	    t=$$(yq ".env.$$k | tag" $(MANIFEST)); \
 	    if [ "$$t" != "!!str" ]; then \
 	      echo "env.$$k must be a string value (found $$t) → see docs/contract.md"; \
 	      exit 1; \
 	    fi; \
 	  done; \
+	fi
+	@if [ "$$(yq '.secrets' $(MANIFEST))" != "null" ]; then \
+	  if [ "$$(yq '.secrets | tag' $(MANIFEST))" != "!!seq" ]; then \
+	    echo "secrets must be a list of environment variable names → see docs/contract.md"; exit 1; \
+	  fi; \
+	  count=$$(yq '.secrets | length' $(MANIFEST)); \
+	  if [ "$$count" -gt 20 ] 2>/dev/null; then \
+	    echo "secrets has $$count entries — at most 20 are supported → see docs/contract.md"; exit 1; \
+	  fi; \
+	  i=0; \
+	  while [ "$$i" -lt "$$count" ]; do \
+	    t=$$(yq ".secrets[$$i] | tag" $(MANIFEST)); \
+	    n=$$(yq ".secrets[$$i]" $(MANIFEST)); \
+	    if [ "$$t" != "!!str" ]; then \
+	      echo "secrets[$$i] must be a string name (found $$t) → see docs/contract.md"; exit 1; \
+	    fi; \
+	    echo "$$n" | grep -Eq '^[A-Z][A-Z0-9_]{0,63}$$' || { \
+	      echo "secrets[$$i] '$$n' is invalid — must match ^[A-Z][A-Z0-9_]{0,63}$$ → see docs/contract.md"; exit 1; \
+	    }; \
+	    case "$$n" in \
+	      STORAGE_BUCKET|COGNITO_USER_POOL_ID|COGNITO_CLIENT_ID|COGNITO_DOMAIN|COGNITO_ISSUER|MAIL_FROM|MAIL_REGION) \
+	        echo "secrets[$$i] '$$n' is reserved for platform injection → see docs/contract.md"; exit 1 ;; \
+	    esac; \
+	    if [ "$$(yq ".env | has(\"$$n\")" $(MANIFEST))" = "true" ]; then \
+	      echo "'$$n' cannot appear in both env and secrets → see docs/contract.md"; exit 1; \
+	    fi; \
+	    i=$$((i + 1)); \
+	  done; \
+	  dupes=$$(yq '.secrets[]' $(MANIFEST) | sort | uniq -d); \
+	  if [ -n "$$dupes" ]; then \
+	    echo "secrets entries must be unique — duplicate(s): $$dupes → see docs/contract.md"; exit 1; \
+	  fi; \
+	fi
+	@if [ "$$(yq '.storage' $(MANIFEST))" != "null" ]; then \
+	  storage=$$(yq '.storage' $(MANIFEST)); \
+	  case "$$storage" in \
+	    s3|s3-retained) : ;; \
+	    *) echo "storage '$$storage' is invalid — only 's3' or 's3-retained' is supported → see docs/contract.md"; \
+	       exit 1 ;; \
+	  esac; \
+	fi
+	@if [ "$$(yq '.alerts' $(MANIFEST))" != "null" ]; then \
+	  count=$$(yq '.alerts | length' $(MANIFEST)); \
+	  if [ "$$count" -gt 10 ] 2>/dev/null; then \
+	    echo "alerts has $$count entries — at most 10 are supported → see docs/contract.md"; \
+	    exit 1; \
+	  fi; \
+	  i=0; \
+	  while [ "$$i" -lt "$$count" ]; do \
+	    for k in $$(yq ".alerts[$$i] | keys | .[]" $(MANIFEST)); do \
+	      case "$$k" in \
+	        name|pattern) : ;; \
+	        *) echo "alerts[$$i] has unknown key '$$k' — only name and pattern are allowed → see docs/contract.md"; exit 1 ;; \
+	      esac; \
+	    done; \
+	    n=$$(yq ".alerts[$$i].name" $(MANIFEST)); \
+	    p=$$(yq ".alerts[$$i].pattern" $(MANIFEST)); \
+	    echo "$$n" | grep -Eq '^[a-z][a-z0-9-]{0,31}$$' || { \
+	      echo "alerts[$$i].name '$$n' is invalid — must match ^[a-z][a-z0-9-]{0,31}$$ → see docs/contract.md"; \
+	      exit 1; \
+	    }; \
+	    if [ "$$p" = "null" ] || [ -z "$$p" ]; then \
+	      echo "alerts[$$i].pattern is missing or empty — must be a CloudWatch Logs filter pattern → see docs/contract.md"; \
+	      exit 1; \
+	    fi; \
+	    i=$$((i + 1)); \
+	  done; \
+	  dupes=$$(yq '.alerts[].name' $(MANIFEST) | sort | uniq -d); \
+	  if [ -n "$$dupes" ]; then \
+	    echo "alerts[].name values must be unique — duplicate(s): $$dupes → see docs/contract.md"; \
+	    exit 1; \
+	  fi; \
+	fi
+	@if [ "$$(yq '.auth' $(MANIFEST))" != "null" ]; then \
+	  auth=$$(yq '.auth' $(MANIFEST)); \
+	  if [ "$$auth" != "cognito" ]; then \
+	    echo "auth '$$auth' is invalid — only 'cognito' is supported → see docs/contract.md"; \
+	    exit 1; \
+	  fi; \
+	fi
+	@if [ "$$(yq '.email' $(MANIFEST))" != "null" ]; then \
+	  if [ "$$(yq '.email | tag' $(MANIFEST))" != "!!map" ]; then \
+	    echo "email must be a mapping with a 'from' address → see docs/contract.md"; exit 1; \
+	  fi; \
+	  for k in $$(yq '.email | keys | .[]' $(MANIFEST)); do \
+	    case "$$k" in \
+	      from) : ;; \
+	      *) echo "email has unknown key '$$k' — only 'from' is allowed → see docs/contract.md"; exit 1 ;; \
+	    esac; \
+	  done; \
+	  from=$$(yq '.email.from' $(MANIFEST)); \
+	  if [ "$$from" = "null" ]; then \
+	    echo "email is missing required key 'from' — the address prod sends as → see docs/contract.md"; exit 1; \
+	  fi; \
+	  if [ "$$(yq '.email.from | tag' $(MANIFEST))" != "!!str" ]; then \
+	    echo "email.from must be a string address → see docs/contract.md"; exit 1; \
+	  fi; \
+	  echo "$$from" | grep -Eq '^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$$' || { \
+	    echo "email.from '$$from' is invalid — must be a bare lowercase address with no display name, e.g. billing@example.com → see docs/contract.md"; \
+	    exit 1; \
+	  }; \
 	fi
 	@echo "==> manifest OK"
 
@@ -104,17 +230,17 @@ build-image:
 health-check:
 	@port=$$(yq '.port' $(MANIFEST)); \
 	hc=$$(yq '.healthcheck' $(MANIFEST)); \
-	envargs=""; \
+	set --; \
 	if [ "$$(yq '.env' $(MANIFEST))" != "null" ]; then \
 	  for k in $$(yq '.env | keys | .[]' $(MANIFEST)); do \
 	    v=$$(yq ".env.$$k" $(MANIFEST)); \
-	    envargs="$$envargs -e $$k=$$v"; \
+	    set -- "$$@" -e "$$k=$$v"; \
 	  done; \
 	fi; \
 	docker rm -f $(CONTAINER) >/dev/null 2>&1 || true; \
 	trap 'docker rm -f $(CONTAINER) >/dev/null 2>&1 || true' EXIT; \
 	echo "==> starting container"; \
-	docker run -d --name $(CONTAINER) -p $$port:$$port $$envargs $(IMAGE) >/dev/null || { \
+	docker run -d --name $(CONTAINER) -p $$port:$$port "$$@" $(IMAGE) >/dev/null || { \
 	  echo "container failed to start → see docs/contract.md"; \
 	  exit 1; \
 	}; \
@@ -158,18 +284,142 @@ scan:
 
 run: build-image
 	@port=$$(yq '.port' $(MANIFEST)); \
-	envargs=""; \
+	set --; \
 	if [ "$$(yq '.env' $(MANIFEST))" != "null" ]; then \
 	  for k in $$(yq '.env | keys | .[]' $(MANIFEST)); do \
 	    v=$$(yq ".env.$$k" $(MANIFEST)); \
-	    envargs="$$envargs -e $$k=$$v"; \
+	    set -- "$$@" -e "$$k=$$v"; \
 	  done; \
 	fi; \
 	echo "==> running on port $$port (ctrl-c to stop)"; \
-	docker run --rm -p $$port:$$port $$envargs --name $(CONTAINER) $(IMAGE)
+	docker run --rm -p $$port:$$port "$$@" --name $(CONTAINER) $(IMAGE)
 
-# Smoke test (create -> list -> complete, plus the error-path quality bar):
-# runs on the host with plain Node, no container involved.
+# App test logic lives in test.sh, NOT here — the Makefile is 100%
+# platform-owned and whole-file replaceable by `make upgrade`.
 test:
-	@command -v node >/dev/null 2>&1 || { echo "node not found — install Node.js to run tests"; exit 1; }
-	@node --test test/smoke.test.js
+	@if [ -f test.sh ]; then \
+	  sh ./test.sh; \
+	else \
+	  echo "no test.sh found for this app — create test.sh at the repo root with your test command → see docs/example.md"; \
+	fi
+
+# ---------------------------------------------------------------------------
+# 6. Upgrade — refresh platform-owned files to a flightdeck release
+# ---------------------------------------------------------------------------
+#
+# make upgrade            — upgrades to the latest published vX.Y.Z tag
+# make upgrade TAG=v0.4.0 — upgrades (or downgrades) to a specific tag
+#
+# Replaces the platform-owned file set below from the tagged release and
+# never touches app-owned files (app-manifest.yaml, Dockerfile, test.sh,
+# source code). Refuses to run over uncommitted changes under those paths.
+# Never commits — review with git diff/git status and commit yourself.
+
+upgrade:
+	@set -e; \
+	tag="$(TAG)"; \
+	if [ -z "$$tag" ]; then \
+	  echo "==> no TAG given, resolving latest release from $(REPO_URL)"; \
+	  tag=$$(git ls-remote --tags $(REPO_URL).git 'v*' | grep -v '\^{}' | awk -F/ '{print $$NF}' | sort -V | tail -1); \
+	  if [ -z "$$tag" ]; then \
+	    echo "could not resolve latest tag from $(REPO_URL) — pass TAG=vX.Y.Z explicitly"; \
+	    exit 1; \
+	  fi; \
+	fi; \
+	echo "==> upgrading platform-owned files to $$tag"; \
+	echo "$$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$' || { echo "TAG must match vX.Y.Z"; exit 1; }; \
+	for p in AGENTS.md CLAUDE.md docs app-manifest.schema.json main.tf .github/workflows/ci.yml .flightdeck-version .flightdeck-provenance Makefile; do \
+	  if [ -n "$$(git status --porcelain -- "$$p" 2>/dev/null)" ]; then \
+	    echo "uncommitted changes under platform-owned paths — commit or stash them first (do NOT discard; make upgrade never destroys work)"; \
+	    exit 1; \
+	  fi; \
+	done; \
+	if [ -f .flightdeck-version ]; then prev=$$(cat .flightdeck-version); else prev="pre-v0.5.0"; fi; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	resolve_tag() { \
+	  git ls-remote --tags "$(REPO_URL).git" "refs/tags/$$tag" "refs/tags/$$tag^{}" | \
+	    awk -v direct="refs/tags/$$tag" -v peeled="refs/tags/$$tag^{}" '$$2 == direct { d=$$1 } $$2 == peeled { p=$$1 } END { print (p != "" ? p : d) }'; \
+	}; \
+	commit=$$(resolve_tag); \
+	echo "$$commit" | grep -Eq '^[0-9a-f]{40}$$' || { echo "could not resolve $$tag to an immutable commit"; exit 1; }; \
+	echo "==> fetching $$tag at immutable commit $$commit"; \
+	curl -fsSL "$(REPO_URL)/archive/$$commit.tar.gz" -o "$$tmpdir/release.tar.gz" || { \
+	  echo "failed to fetch $$tag from $(REPO_URL) — check the tag exists and network is reachable"; \
+	  exit 1; \
+	}; \
+	if command -v sha256sum >/dev/null 2>&1; then \
+	  hash_output=$$(sha256sum "$$tmpdir/release.tar.gz") || { echo "failed to calculate release archive SHA-256"; exit 1; }; \
+	elif command -v shasum >/dev/null 2>&1; then \
+	  hash_output=$$(shasum -a 256 "$$tmpdir/release.tar.gz") || { echo "failed to calculate release archive SHA-256"; exit 1; }; \
+	else \
+	  echo "cannot verify release archive: sha256sum or shasum is required"; \
+	  exit 1; \
+	fi; \
+	archive_sha=$$(printf '%s\n' "$$hash_output" | awk '{print $$1}'); \
+	echo "$$archive_sha" | grep -Eq '^[0-9a-fA-F]{64}$$' || { echo "release archive returned an invalid SHA-256"; exit 1; }; \
+	tar -xzf "$$tmpdir/release.tar.gz" -C "$$tmpdir" || { echo "failed to extract $$tag archive"; exit 1; }; \
+	src=$$(find "$$tmpdir" -type d -path '*/template-app' | head -1); \
+	if [ -z "$$src" ]; then \
+	  echo "could not find template-app/ inside $$tag archive"; \
+	  exit 1; \
+	fi; \
+	for required in AGENTS.md CLAUDE.md app-manifest.schema.json main.tf Makefile .github/workflows/ci.yml; do \
+	  if [ ! -f "$$src/$$required" ]; then \
+	    echo "malformed release archive: missing template-app/$$required"; \
+	    echo "no files were replaced"; \
+	    exit 1; \
+	  fi; \
+	done; \
+	if [ ! -d "$$src/docs" ]; then \
+	  echo "malformed release archive: missing template-app/docs"; \
+	  echo "no files were replaced"; \
+	  exit 1; \
+	fi; \
+	if [ -f "$$src/.flightdeck-version" ]; then \
+	  embedded=$$(cat "$$src/.flightdeck-version"); \
+	else \
+	  embedded=""; \
+	fi; \
+	if [ -n "$$embedded" ] && [ "$$embedded" != "$$tag" ]; then \
+	  echo "release marker mismatch: requested $$tag but immutable archive records $${embedded:-<missing>}"; \
+	  echo "no files were replaced"; \
+	  exit 1; \
+	fi; \
+	if [ -z "$$embedded" ] && ! awk -v tag="$$tag" 'BEGIN { sub(/^v/, "", tag); split(tag, v, "."); exit ! (v[1] + 0 == 0 && v[2] + 0 < 5) }'; then \
+	  echo "release marker missing from $$tag archive (only releases before v0.5.0 may omit it)"; \
+	  echo "no files were replaced"; \
+	  exit 1; \
+	fi; \
+	verified_commit=$$(resolve_tag); \
+	if [ "$$verified_commit" != "$$commit" ]; then \
+	  echo "release provenance changed while fetching $$tag ($$commit -> $${verified_commit:-unresolved})"; \
+	  echo "no files were replaced"; \
+	  exit 1; \
+	fi; \
+	if [ -f "$$src/app-manifest.schema.json" ] && [ -f $(MANIFEST) ]; then \
+	  allowed=" $$(yq '.properties | keys | .[]' "$$src/app-manifest.schema.json" | tr -d '"' | tr '\n' ' ')"; \
+	  for k in $$(yq 'keys | .[]' $(MANIFEST)); do \
+	    case "$$allowed" in \
+	      *" $$k "*) : ;; \
+	      *) echo "WARNING: your manifest uses '$$k' which $$tag's schema does not define — preflight will fail until you remove it or pick a newer tag" ;; \
+	    esac; \
+	  done; \
+	fi; \
+	cp -f "$$src/AGENTS.md" AGENTS.md; \
+	cp -f "$$src/CLAUDE.md" CLAUDE.md; \
+	rm -rf docs && cp -R "$$src/docs" docs; \
+	cp -f "$$src/app-manifest.schema.json" app-manifest.schema.json; \
+	cp -f "$$src/main.tf" main.tf; \
+	mkdir -p .github/workflows && cp -f "$$src/.github/workflows/ci.yml" .github/workflows/ci.yml; \
+	if [ -f "$$src/.flightdeck-version" ]; then \
+	  cp -f "$$src/.flightdeck-version" .flightdeck-version; \
+	else \
+	  echo "$$tag" > .flightdeck-version; \
+	fi; \
+	printf 'tag=%s\ncommit=%s\narchive_sha256=%s\n' "$$tag" "$$commit" "$$archive_sha" > .flightdeck-provenance; \
+	cp -f "$$src/Makefile" Makefile; \
+	echo "==> upgraded: $$prev -> $$tag"; \
+	echo "verified provenance: commit=$$commit archive_sha256=$$archive_sha"; \
+	echo "files replaced: AGENTS.md CLAUDE.md docs app-manifest.schema.json main.tf .github/workflows/ci.yml .flightdeck-version .flightdeck-provenance Makefile"; \
+	echo "review with: git diff && git status, then commit. make upgrade never commits."

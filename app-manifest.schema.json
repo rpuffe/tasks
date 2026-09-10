@@ -2,13 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/rpuffe/flightdeck/blob/main/template-app/app-manifest.schema.json",
   "title": "flightdeck app-manifest",
-  "description": "The flightdeck app-manifest contract (v1, spec §6). Exactly six fields, nothing else — CI supplies the image, never add an image field.",
+  "description": "The flightdeck app-manifest contract. Core fields plus optional storage, auth, alerts, and managed-secret opt-ins; CI supplies the image.",
   "type": "object",
   "properties": {
     "name": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9-]{0,19}$",
-      "description": "DNS-safe service name; becomes the URL host (https://<name>.fd.robertpuffe.com) and all AWS resource names. Lowercase letters, digits, hyphens; must start with a letter; max 20 characters."
+      "pattern": "^[a-z][a-z0-9-]{0,15}$",
+      "not": { "const": "wake" },
+      "description": "DNS-safe service name; becomes the URL host (https://<name>.fd.robertpuffe.com) and all AWS resource names. Lowercase letters, digits, hyphens; must start with a letter; max 16 characters (dev stacks append \"-dev\", so this leaves room under the 32-char target-group name limit). \"wake\" is reserved for the platform scaler endpoint."
     },
     "port": {
       "type": "integer",
@@ -32,11 +33,81 @@
     },
     "env": {
       "type": "object",
-      "description": "Non-secret config only — NO secrets, tokens, or credentials; v1 has no secret support. Flat map of string keys to string values.",
+      "description": "Non-secret config only — no tokens or credentials. Put secret names under 'secrets'. Flat map of string keys to string values. STORAGE_BUCKET and the COGNITO_* keys are reserved for platform injection.",
       "additionalProperties": {
         "type": "string"
       },
+      "not": {
+        "anyOf": [
+          { "required": ["STORAGE_BUCKET"] },
+          { "required": ["COGNITO_USER_POOL_ID"] },
+          { "required": ["COGNITO_CLIENT_ID"] },
+          { "required": ["COGNITO_DOMAIN"] },
+          { "required": ["COGNITO_ISSUER"] },
+          { "required": ["MAIL_FROM"] },
+          { "required": ["MAIL_REGION"] }
+        ]
+      },
       "default": {}
+    },
+    "secrets": {
+      "type": "array",
+      "maxItems": 20,
+      "uniqueItems": true,
+      "description": "Secret environment variable names only. Values live in SSM Parameter Store at /flightdeck/<app>/<environment>/<NAME> and must never appear in the manifest, Terraform variables, logs, or command lines.",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+        "not": {
+          "enum": ["STORAGE_BUCKET", "COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID", "COGNITO_DOMAIN", "COGNITO_ISSUER", "MAIL_FROM", "MAIL_REGION"]
+        }
+      },
+      "default": []
+    },
+    "storage": {
+      "type": "string",
+      "enum": ["s3", "s3-retained"],
+      "description": "Opt in to a private, encrypted S3 bucket for this environment (dev and prod get separate buckets). Grants the app's task role access to exactly that bucket and nothing else. The bucket name arrives via the STORAGE_BUCKET env var — do not set that key yourself in 'env'. 's3': data is destroyed with the stack. 's3-retained': the bucket is versioned (90-day noncurrent retention) and survives a stack teardown — terraform cannot delete it while it holds data. Either value also switches the service to stop-then-start deploys so at most one task ever writes (see docs/contract.md)."
+    },
+    "alerts": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "Optional log-pattern alerts. Each entry becomes a CloudWatch Logs metric filter on the app's log group plus an alarm that fires on any matching log line within 5 minutes and notifies the platform's alert email. Use for failure signatures worth waking a human for (e.g. a replication sidecar's error lines). Patterns use CloudWatch Logs filter syntax and are passed through verbatim.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,31}$",
+            "description": "DNS-safe suffix for the alarm and metric-filter names. Lowercase letters, digits, hyphens; starts with a letter; max 32 chars; unique within the list."
+          },
+          "pattern": {
+            "type": "string",
+            "minLength": 1,
+            "description": "CloudWatch Logs filter pattern matched against every log line, e.g. \"level=ERROR\" (quotes included for term matching)."
+          }
+        },
+        "required": ["name", "pattern"],
+        "additionalProperties": false
+      }
+    },
+    "auth": {
+      "type": "string",
+      "enum": ["cognito"],
+      "description": "Opt in to a Cognito user pool for this environment (dev and prod get separate pools) with a public PKCE app client and hosted login UI. Identifiers arrive via the reserved COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_DOMAIN, and COGNITO_ISSUER env vars — do not set those keys yourself in 'env'. No AWS SDK calls or client secret involved; verify tokens against the issuer's JWKS. User accounts are destroyed with the stack (see docs/contract.md)."
+    },
+    "email": {
+      "type": "object",
+      "description": "Opt in to outbound mail through SES. The task role gains permission to send as exactly the declared address and nothing else, and MAIL_FROM/MAIL_REGION arrive as reserved env vars — do not set those keys yourself in 'env'. Dev ignores the declared address and sends as <name>-dev@fd.robertpuffe.com, so test traffic never spends the production domain's sending reputation. Two prerequisites the manifest cannot express: the From domain must be a verified SES identity, and the platform operator must authorize this app in the bootstrap mail_senders registry — an app cannot grant itself sending (see docs/contract.md).",
+      "properties": {
+        "from": {
+          "type": "string",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "description": "Exact From address prod sends as, e.g. billing@example.com. Bare address only — no display name, no angle brackets; set the human-readable display name in the app when it composes the message."
+        }
+      },
+      "required": ["from"],
+      "additionalProperties": false
     }
   },
   "required": ["name", "port", "healthcheck", "cpu", "memory"],

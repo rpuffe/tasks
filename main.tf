@@ -41,6 +41,17 @@ variable "image" {
   type        = string
 }
 
+variable "environment" {
+  description = "Deploy environment. \"prod\" resource names are unprefixed; \"dev\" resource names get a \"-dev\" suffix. Supplied by CI at apply time; deliberately not a manifest field."
+  type        = string
+  default     = "prod"
+
+  validation {
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "environment must be exactly \"dev\" or \"prod\"."
+  }
+}
+
 data "terraform_remote_state" "bootstrap" {
   backend = "s3"
 
@@ -56,16 +67,22 @@ locals {
 }
 
 module "app" {
-  source = "git::https://github.com/rpuffe/flightdeck.git//modules/fargate-service?ref=v0.2.0"
+  source = "git::https://github.com/rpuffe/flightdeck.git//modules/fargate-service?ref=v0.10.1"
 
   name             = local.manifest.name
   port             = local.manifest.port
   healthcheck_path = local.manifest.healthcheck
   cpu              = local.manifest.cpu
   memory           = local.manifest.memory
-  env              = local.manifest.env
+  env              = try(local.manifest.env, {})
+  secrets          = try(local.manifest.secrets, [])
+  storage          = try(local.manifest.storage, "")
+  auth             = try(local.manifest.auth, "")
+  alerts           = try(local.manifest.alerts, [])
+  email_from       = try(local.manifest.email.from, "")
 
-  image = var.image
+  image       = var.image
+  environment = var.environment
 
   cluster_arn           = data.terraform_remote_state.bootstrap.outputs.cluster_arn
   vpc_id                = data.terraform_remote_state.bootstrap.outputs.vpc_id
@@ -73,6 +90,7 @@ module "app" {
   alb_security_group_id = data.terraform_remote_state.bootstrap.outputs.alb_security_group_id
   https_listener_arn    = data.terraform_remote_state.bootstrap.outputs.https_listener_arn
   child_zone_name       = data.terraform_remote_state.bootstrap.outputs.child_zone_name
+  alerts_topic_arn      = data.terraform_remote_state.bootstrap.outputs.alerts_topic_arn
 }
 
 output "url" {

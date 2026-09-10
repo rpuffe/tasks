@@ -12,12 +12,51 @@ Terraform, or DNS.
 **Never edit `main.tf` or `.github/workflows/ci.yml`.** Both are pinned
 platform boilerplate; editing either takes the app off the platform.
 
+**`make upgrade` refreshes every platform-owned file to the latest platform
+release** (see `docs/pipeline.md`); never hand-edit platform files.
+
 **The manifest is `app-manifest.yaml`**, validated against
 `app-manifest.schema.json` — let `make preflight` catch field-level mistakes.
+
+**Environments**: push to `main` deploys dev
+(`https://<name>-dev.fd.robertpuffe.com`); tagging `v*` promotes that exact
+image to prod (`https://<name>.fd.robertpuffe.com`) — no rebuild. Pull
+requests only run credential-free checks (build, scans, fmt/validate); no
+deploy happens on a PR.
+
+**Optional `storage: s3`** in the manifest grants a private per-environment
+bucket via the injected `STORAGE_BUCKET` env var. Your healthcheck must
+never depend on it — see `docs/contract.md`. `storage: s3-retained` is the
+production-data variant: versioned, survives stack teardown. Either value
+also makes deploys stop-then-start (single-writer guarantee, brief deploy
+downtime).
+
+**Optional `auth: cognito`** in the manifest grants a per-environment
+Cognito user pool + hosted login via injected `COGNITO_*` env vars (plain
+OIDC, no AWS SDK, no secrets). Your healthcheck must never require login —
+see `docs/contract.md`.
+
+**Optional `secrets:`** lists environment variable names whose values are
+operator-managed SSM SecureStrings. Names only — never put values in the
+manifest, repository, Terraform inputs, or command line. Local preflight does
+not inject secrets, so integrations must disable cleanly and `/healthz` must
+still pass. See `docs/contract.md`.
+
+**Optional `alerts:`** in the manifest turns log-line failure signatures
+(CloudWatch Logs filter patterns) into alarms that email the platform
+operator — for failures a green healthcheck can hide, like a replication
+error. See `docs/contract.md`.
+
+**Optional `email:`** in the manifest grants scoped SES permission to send as
+one declared address, injected as `MAIL_FROM`/`MAIL_REGION`. Dev always sends
+from the platform zone, never the production address. Needs the From domain
+verified in SES *and* an operator-side grant — an app cannot enable its own
+sending. Mail must disable cleanly when `MAIL_FROM` is unset. See
+`docs/contract.md`.
 
 ## Docs — read the one for the task at hand, not all of them upfront
 
 - `docs/contract.md` — runtime expectations: what your app must do, what the platform already does for you.
 - `docs/dockerfile.md` — image rules and scan gates.
-- `docs/pipeline.md` — what a push to `main` triggers, and a failure→fix playbook.
+- `docs/pipeline.md` — what PRs, pushes to `main`, and `v*` tags each trigger, and a failure→fix playbook.
 - `docs/example.md` — a worked example, built end-to-end.
